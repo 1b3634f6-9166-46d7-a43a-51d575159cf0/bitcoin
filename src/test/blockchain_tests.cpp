@@ -1,19 +1,29 @@
+// Copyright (c) 2017-present The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <chain.h>
+#include <node/blockstorage.h>
+#include <rpc/blockchain.h>
+#include <sync.h>
+#include <test/util/setup_common.h>
+#include <util/string.h>
+
 #include <boost/test/unit_test.hpp>
 
-#include "stdlib.h"
+#include <cstdlib>
 
-#include "rpc/blockchain.cpp"
-#include "test/test_bitcoin.h"
+using util::ToString;
 
 /* Equality between doubles is imprecise. Comparison should be done
  * with a small threshold of tolerance, rather than exact equality.
  */
-bool DoubleEquals(double a, double b, double epsilon)
+static bool DoubleEquals(double a, double b, double epsilon)
 {
     return std::abs(a - b) < epsilon;
 }
 
-CBlockIndex* CreateBlockIndexWithNbits(uint32_t nbits)
+static CBlockIndex* CreateBlockIndexWithNbits(uint32_t nbits)
 {
     CBlockIndex* block_index = new CBlockIndex();
     block_index->nHeight = 46367;
@@ -22,39 +32,26 @@ CBlockIndex* CreateBlockIndexWithNbits(uint32_t nbits)
     return block_index;
 }
 
-CChain CreateChainWithNbits(uint32_t nbits)
-{
-    CBlockIndex* block_index = CreateBlockIndexWithNbits(nbits);
-    CChain chain;
-    chain.SetTip(block_index);
-    return chain;
-}
-
-void RejectDifficultyMismatch(double difficulty, double expected_difficulty) {
+static void RejectDifficultyMismatch(double difficulty, double expected_difficulty) {
      BOOST_CHECK_MESSAGE(
         DoubleEquals(difficulty, expected_difficulty, 0.00001),
-        "Difficulty was " + std::to_string(difficulty)
-            + " but was expected to be " + std::to_string(expected_difficulty));
+        "Difficulty was " + ToString(difficulty)
+            + " but was expected to be " + ToString(expected_difficulty));
 }
 
 /* Given a BlockIndex with the provided nbits,
  * verify that the expected difficulty results.
  */
-void TestDifficulty(uint32_t nbits, double expected_difficulty)
+static void TestDifficulty(uint32_t nbits, double expected_difficulty)
 {
     CBlockIndex* block_index = CreateBlockIndexWithNbits(nbits);
-    /* Since we are passing in block index explicitly,
-     * there is no need to set up anything within the chain itself.
-     */
-    CChain chain;
-
-    double difficulty = GetDifficulty(chain, block_index);
+    double difficulty = GetDifficulty(*block_index);
     delete block_index;
 
     RejectDifficultyMismatch(difficulty, expected_difficulty);
 }
 
-BOOST_FIXTURE_TEST_SUITE(blockchain_difficulty_tests, BasicTestingSetup)
+BOOST_FIXTURE_TEST_SUITE(blockchain_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(get_difficulty_for_very_low_target)
 {
@@ -81,46 +78,73 @@ BOOST_AUTO_TEST_CASE(get_difficulty_for_very_high_target)
     TestDifficulty(0x12345678, 5913134931067755359633408.0);
 }
 
-// Verify that difficulty is 1.0 for an empty chain.
-BOOST_AUTO_TEST_CASE(get_difficulty_for_null_tip)
+//! Prune chain from height down to genesis block and check that
+//! GetPruneHeight returns the correct value
+static void CheckGetPruneHeight(const node::BlockManager& blockman, const CChain& chain, int height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
-    CChain chain;
-    double difficulty = GetDifficulty(chain, nullptr);
-    RejectDifficultyMismatch(difficulty, 1.0);
+    AssertLockHeld(::cs_main);
+
+    // Emulate pruning all blocks from `height` down to the genesis block
+    // by unsetting the `BLOCK_HAVE_DATA` flag from `nStatus`
+    for (CBlockIndex* it{chain[height]}; it != nullptr && it->nHeight > 0; it = it->pprev) {
+        it->nStatus &= ~BLOCK_HAVE_DATA;
+    }
+
+    const auto prune_height{GetPruneHeight(blockman, chain)};
+    BOOST_REQUIRE(prune_height.has_value());
+    BOOST_CHECK_EQUAL(*prune_height, height);
 }
 
-/* Verify that if difficulty is based upon the block index
- * in the chain, if no block index is explicitly specified.
- */
-BOOST_AUTO_TEST_CASE(get_difficulty_for_null_block_index)
+BOOST_FIXTURE_TEST_CASE(get_prune_height, TestChain100Setup)
 {
-    CChain chain = CreateChainWithNbits(0x1df88f6f);
+    LOCK(::cs_main);
+    const auto& chain = m_node.chainman->ActiveChain();
+    const auto& blockman = m_node.chainman->m_blockman;
 
-    double difficulty = GetDifficulty(chain, nullptr);
-    delete chain.Tip();
+    // Fresh chain of 100 blocks without any pruned blocks, so std::nullopt should be returned
+    BOOST_CHECK(!GetPruneHeight(blockman, chain).has_value());
 
-    double expected_difficulty = 0.004023;
-
-    RejectDifficultyMismatch(difficulty, expected_difficulty);
+    // Start pruning
+    CheckGetPruneHeight(blockman, chain, 1);
+    CheckGetPruneHeight(blockman, chain, 99);
+    CheckGetPruneHeight(blockman, chain, 100);
 }
 
-/* Verify that difficulty is based upon the explicitly specified
- * block index rather than being taken from the provided chain,
- * when both are present.
- */
-BOOST_AUTO_TEST_CASE(get_difficulty_for_block_index_overrides_tip)
+BOOST_AUTO_TEST_CASE(num_chain_tx_max)
 {
-    CChain chain = CreateChainWithNbits(0x1df88f6f);
-    /* This block index's nbits should be used
-     * instead of the chain's when calculating difficulty.
-     */
-    CBlockIndex* override_block_index = CreateBlockIndexWithNbits(0x12345678);
+    CBlockIndex block_index{};
+    block_index.m_chain_tx_count = std::numeric_limits<uint64_t>::max();
+    BOOST_CHECK_EQUAL(block_index.m_chain_tx_count, std::numeric_limits<uint64_t>::max());
+}
 
-    double difficulty = GetDifficulty(chain, override_block_index);
-    delete chain.Tip();
-    delete override_block_index;
+BOOST_FIXTURE_TEST_CASE(invalidate_block, TestChain100Setup)
+{
+    const CChain& active{*WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return &Assert(m_node.chainman)->ActiveChain())};
 
-    RejectDifficultyMismatch(difficulty, 5913134931067755359633408.0);
+    // Check BlockStatus when doing InvalidateBlock()
+    BlockValidationState state;
+    auto* orig_tip = active.Tip();
+    int height_to_invalidate = orig_tip->nHeight - 10;
+    auto* tip_to_invalidate = active[height_to_invalidate];
+    m_node.chainman->ActiveChainstate().InvalidateBlock(state, tip_to_invalidate);
+
+    // tip_to_invalidate just got invalidated, so it's BLOCK_FAILED_VALID
+    WITH_LOCK(::cs_main, assert(tip_to_invalidate->nStatus & BLOCK_FAILED_VALID));
+
+    // check all ancestors of the invalidated block are validated up to BLOCK_VALID_TRANSACTIONS and are not invalid
+    auto pindex = tip_to_invalidate->pprev;
+    while (pindex) {
+        WITH_LOCK(::cs_main, assert(pindex->IsValid(BLOCK_VALID_TRANSACTIONS)));
+        WITH_LOCK(::cs_main, assert((pindex->nStatus & BLOCK_FAILED_VALID) == 0));
+        pindex = pindex->pprev;
+    }
+
+    // check all descendants of the invalidated block are BLOCK_FAILED_VALID
+    pindex = orig_tip;
+    while (pindex && pindex != tip_to_invalidate) {
+        WITH_LOCK(::cs_main, assert(pindex->nStatus & BLOCK_FAILED_VALID));
+        pindex = pindex->pprev;
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -1,22 +1,28 @@
-// Copyright (c) 2012-2017 The Bitcoin Core developers
+// Copyright (c) 2012-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <util.h>
-
-#include <support/allocators/secure.h>
-#include <test/test_bitcoin.h>
+#include <common/system.h>
+#include <support/lockedpool.h>
+#include <test/util/common.h>
+#include <util/byte_units.h>
 
 #include <boost/test/unit_test.hpp>
 
-BOOST_FIXTURE_TEST_SUITE(allocator_tests, BasicTestingSetup)
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+BOOST_AUTO_TEST_SUITE(allocator_tests)
 
 BOOST_AUTO_TEST_CASE(arena_tests)
 {
     // Fake memory base address for testing
     // without actually using memory.
     void *synth_base = reinterpret_cast<void*>(0x08000000);
-    const size_t synth_size = 1024*1024;
+    const size_t synth_size{1_MiB};
     Arena b(synth_base, synth_size, 16);
     void *chunk = b.alloc(1000);
 #ifdef ARENA_DEBUG
@@ -31,12 +37,7 @@ BOOST_AUTO_TEST_CASE(arena_tests)
 #endif
     BOOST_CHECK(b.stats().used == 0);
     BOOST_CHECK(b.stats().free == synth_size);
-    try { // Test exception on double-free
-        b.free(chunk);
-        BOOST_CHECK(0);
-    } catch(std::runtime_error &)
-    {
-    }
+    BOOST_CHECK_EXCEPTION(b.free(chunk), std::runtime_error, HasReason{"Arena: invalid or double free"});
 
     void *a0 = b.alloc(128);
     void *a1 = b.alloc(256);
@@ -62,10 +63,10 @@ BOOST_AUTO_TEST_CASE(arena_tests)
     BOOST_CHECK(b.stats().used == 128);
     b.free(a3);
     BOOST_CHECK(b.stats().used == 0);
-    BOOST_CHECK_EQUAL(b.stats().chunks_used, 0);
+    BOOST_CHECK_EQUAL(b.stats().chunks_used, 0U);
     BOOST_CHECK(b.stats().total == synth_size);
     BOOST_CHECK(b.stats().free == synth_size);
-    BOOST_CHECK_EQUAL(b.stats().chunks_free, 1);
+    BOOST_CHECK_EQUAL(b.stats().chunks_free, 1U);
 
     std::vector<void*> addr;
     BOOST_CHECK(b.alloc(0) == nullptr); // allocating 0 always returns nullptr
@@ -73,6 +74,7 @@ BOOST_AUTO_TEST_CASE(arena_tests)
     b.walk();
 #endif
     // Sweeping allocate all memory
+    addr.reserve(2048);
     for (int x=0; x<1024; ++x)
         addr.push_back(b.alloc(1024));
     BOOST_CHECK(b.stats().free == 0);
@@ -103,13 +105,13 @@ BOOST_AUTO_TEST_CASE(arena_tests)
     // Go entirely wild: free and alloc interleaved,
     // generate targets and sizes using pseudo-randomness.
     for (int x=0; x<2048; ++x)
-        addr.push_back(0);
+        addr.push_back(nullptr);
     uint32_t s = 0x12345678;
     for (int x=0; x<5000; ++x) {
         int idx = s & (addr.size()-1);
         if (s & 0x80000000) {
             b.free(addr[idx]);
-            addr[idx] = 0;
+            addr[idx] = nullptr;
         } else if(!addr[idx]) {
             addr[idx] = b.alloc((s >> 16) & 2047);
         }
@@ -142,9 +144,9 @@ public:
                 *lockingSuccess = true;
             }
 
-            return reinterpret_cast<void*>(0x08000000 + (count<<24)); // Fake address, do not actually use this memory
+            return reinterpret_cast<void*>(uint64_t{static_cast<uint64_t>(0x08000000) + (count << 24)}); // Fake address, do not actually use this memory
         }
-        return 0;
+        return nullptr;
     }
     void FreeLocked(void* addr, size_t len) override
     {
@@ -161,7 +163,7 @@ private:
 BOOST_AUTO_TEST_CASE(lockedpool_tests_mock)
 {
     // Test over three virtual arenas, of which one will succeed being locked
-    std::unique_ptr<LockedPageAllocator> x(new TestLockedPageAllocator(3, 1));
+    std::unique_ptr<LockedPageAllocator> x = std::make_unique<TestLockedPageAllocator>(3, 1);
     LockedPool pool(std::move(x));
     BOOST_CHECK(pool.stats().total == 0);
     BOOST_CHECK(pool.stats().locked == 0);
@@ -219,12 +221,7 @@ BOOST_AUTO_TEST_CASE(lockedpool_tests_live)
     BOOST_CHECK(*((uint32_t*)a0) == 0x1234);
 
     pool.free(a0);
-    try { // Test exception on double-free
-        pool.free(a0);
-        BOOST_CHECK(0);
-    } catch(std::runtime_error &)
-    {
-    }
+    BOOST_CHECK_EXCEPTION(pool.free(a0), std::runtime_error, HasReason{"Arena: invalid or double free"});
     // If more than one new arena was allocated for the above tests, something is wrong
     BOOST_CHECK(pool.stats().total <= (initial.total + LockedPool::ARENA_SIZE));
     // Usage must be back to where it started

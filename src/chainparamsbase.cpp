@@ -1,66 +1,32 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2017 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparamsbase.h>
 
+#include <common/args.h>
+#include <crypto/hex_base.h>
+#include <kernel/signet.h>
 #include <tinyformat.h>
-#include <util.h>
+#include <util/chaintype.h>
+#include <util/strencodings.h>
 
-#include <assert.h>
+#include <cassert>
 
-const std::string CBaseChainParams::MAIN = "main";
-const std::string CBaseChainParams::TESTNET = "test";
-const std::string CBaseChainParams::REGTEST = "regtest";
-
-void AppendParamsHelpMessages(std::string& strUsage, bool debugHelp)
+void SetupChainParamsBaseOptions(ArgsManager& argsman)
 {
-    strUsage += HelpMessageGroup(_("Chain selection options:"));
-    strUsage += HelpMessageOpt("-testnet", _("Use the test chain"));
-    if (debugHelp) {
-        strUsage += HelpMessageOpt("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
-                                   "This is intended for regression testing tools and app development.");
-    }
+    argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: " LIST_CHAIN_NAMES, ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
+                 "This is intended for regression testing tools and app development. Equivalent to -chain=regtest.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-testactivationheight=name@height.", "Set the activation height of 'name' (segwit, bip34, dersig, cltv, csv). (test-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testnet", "Use the testnet3 chain. Equivalent to -chain=test. Support for testnet3 is deprecated and will be removed in an upcoming release. Consider moving to testnet4 now by using -testnet4.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-testnet4", "Use the testnet4 chain. Equivalent to -chain=testnet4.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-vbparams=deployment:start:end[:min_activation_height]", "Use given start/end times and min_activation_height for specified version bits deployment (test-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-signet", "Use the signet chain. Equivalent to -chain=signet. Note that the network is defined by the -signetchallenge parameter", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-signetchallenge", "Blocks must satisfy the given script to be considered valid (only for signet networks; defaults to the global default signet test network challenge)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-signetseednode", "Specify a seed node for the signet network, in the hostname[:port] format, e.g. sig.net:1234 (may be used multiple times to specify multiple seed nodes; defaults to the global default signet test network seed node(s))", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
 }
-
-/**
- * Main network
- */
-class CBaseMainParams : public CBaseChainParams
-{
-public:
-    CBaseMainParams()
-    {
-        nRPCPort = 8332;
-    }
-};
-
-/**
- * Testnet (v3)
- */
-class CBaseTestNetParams : public CBaseChainParams
-{
-public:
-    CBaseTestNetParams()
-    {
-        nRPCPort = 18332;
-        strDataDir = "testnet3";
-    }
-};
-
-/*
- * Regression test
- */
-class CBaseRegTestParams : public CBaseChainParams
-{
-public:
-    CBaseRegTestParams()
-    {
-        nRPCPort = 18443;
-        strDataDir = "regtest";
-    }
-};
 
 static std::unique_ptr<CBaseChainParams> globalChainBaseParams;
 
@@ -70,33 +36,47 @@ const CBaseChainParams& BaseParams()
     return *globalChainBaseParams;
 }
 
-std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain)
+std::string GetSignetDataDir(const ArgsManager& args)
 {
-    if (chain == CBaseChainParams::MAIN)
-        return std::unique_ptr<CBaseChainParams>(new CBaseMainParams());
-    else if (chain == CBaseChainParams::TESTNET)
-        return std::unique_ptr<CBaseChainParams>(new CBaseTestNetParams());
-    else if (chain == CBaseChainParams::REGTEST)
-        return std::unique_ptr<CBaseChainParams>(new CBaseRegTestParams());
-    else
-        throw std::runtime_error(strprintf("%s: Unknown chain %s.", __func__, chain));
+    std::string base_data_dir = "signet";
+    // no default to treat no -signetchallenge (default signet) as distinct from
+    // the empty -signetchallenge= (custom signet)
+    const auto challenge_hex = args.GetArg("-signetchallenge");
+    if (!challenge_hex) {
+        return base_data_dir;
+    }
+    // -signetchallenge can be invalid hex here (it's checked later in
+    // ReadSigNetArgs), but we don't mind to keep validation in one place.
+    const auto challenge_bytes = TryParseHex<uint8_t>(*challenge_hex);
+    if (!challenge_bytes || *challenge_bytes == kernel::SIGNET_DEFAULT_CHALLENGE) {
+        return base_data_dir;
+    }
+    return base_data_dir + "_" + HexStr(kernel::GetSignetMessageStart(*challenge_bytes));
 }
 
-void SelectBaseParams(const std::string& chain)
+/**
+ * Port numbers for incoming Tor connections (8334, 18334, 38334, 48334, 18445) have
+ * been chosen arbitrarily to keep ranges of used ports tight.
+ */
+std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ArgsManager& args, const ChainType chain)
 {
-    globalChainBaseParams = CreateBaseChainParams(chain);
+    switch (chain) {
+    case ChainType::MAIN:
+        return std::make_unique<CBaseChainParams>("", 8332);
+    case ChainType::TESTNET:
+        return std::make_unique<CBaseChainParams>("testnet3", 18332);
+    case ChainType::TESTNET4:
+        return std::make_unique<CBaseChainParams>("testnet4", 48332);
+    case ChainType::SIGNET:
+        return std::make_unique<CBaseChainParams>(GetSignetDataDir(args), 38332);
+    case ChainType::REGTEST:
+        return std::make_unique<CBaseChainParams>("regtest", 18443);
+    }
+    assert(false);
 }
 
-std::string ChainNameFromCommandLine()
+void SelectBaseParams(const ChainType chain)
 {
-    bool fRegTest = gArgs.GetBoolArg("-regtest", false);
-    bool fTestNet = gArgs.GetBoolArg("-testnet", false);
-
-    if (fTestNet && fRegTest)
-        throw std::runtime_error("Invalid combination of -regtest and -testnet.");
-    if (fRegTest)
-        return CBaseChainParams::REGTEST;
-    if (fTestNet)
-        return CBaseChainParams::TESTNET;
-    return CBaseChainParams::MAIN;
+    gArgs.SelectConfigNetwork(ChainTypeToString(chain));
+    globalChainBaseParams = CreateBaseChainParams(gArgs, chain);
 }

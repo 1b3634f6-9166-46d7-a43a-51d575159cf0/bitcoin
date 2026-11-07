@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2017 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,9 +8,9 @@
 #include <QFile>
 #include <QTextStream>
 
-CSVModelWriter::CSVModelWriter(const QString &_filename, QObject *parent) :
-    QObject(parent),
-    filename(_filename), model(0)
+CSVModelWriter::CSVModelWriter(const QString& _filename, QObject* parent)
+    : QObject(parent),
+      filename(_filename)
 {
 }
 

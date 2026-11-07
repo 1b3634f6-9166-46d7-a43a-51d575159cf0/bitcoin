@@ -1,108 +1,137 @@
-// Copyright (c) 2016-2017 The Bitcoin Core developers
+// Copyright (c) 2016-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <bench/bench.h>
+#include <coins.h>
 #include <key.h>
-#if defined(HAVE_CONSENSUS_LIB)
-#include <script/bitcoinconsensus.h>
-#endif
+#include <policy/policy.h>
+#include <primitives/transaction.h>
+#include <pubkey.h>
+#include <script/interpreter.h>
 #include <script/script.h>
+#include <script/script_error.h>
 #include <script/sign.h>
-#include <streams.h>
+#include <script/signingprovider.h>
+#include <script/verify_flags.h>
+#include <span.h>
+#include <test/util/transaction_utils.h>
+#include <uint256.h>
+#include <util/check.h>
+#include <util/translation.h>
 
-#include <array>
+#include <cstddef>
+#include <map>
+#include <span>
+#include <vector>
 
-// FIXME: Dedup with BuildCreditingTransaction in test/script_tests.cpp.
-static CMutableTransaction BuildCreditingTransaction(const CScript& scriptPubKey)
+enum class ScriptType {
+    P2WPKH, // segwitv0, witness-pubkey-hash (ECDSA signature)
+    P2TR_KeyPath, // segwitv1, taproot key-path spend (Schnorr signature)
+    P2TR_ScriptPath, // segwitv1, taproot script-path spend (Tapscript leaf with a single OP_CHECKSIG)
+};
+
+static size_t ExpectedWitnessStackSize(ScriptType script_type)
 {
-    CMutableTransaction txCredit;
-    txCredit.nVersion = 1;
-    txCredit.nLockTime = 0;
-    txCredit.vin.resize(1);
-    txCredit.vout.resize(1);
-    txCredit.vin[0].prevout.SetNull();
-    txCredit.vin[0].scriptSig = CScript() << CScriptNum(0) << CScriptNum(0);
-    txCredit.vin[0].nSequence = CTxIn::SEQUENCE_FINAL;
-    txCredit.vout[0].scriptPubKey = scriptPubKey;
-    txCredit.vout[0].nValue = 1;
-
-    return txCredit;
+    switch (script_type) {
+    case ScriptType::P2WPKH: return 2; // [pubkey, signature]
+    case ScriptType::P2TR_KeyPath: return 1; // [signature]
+    case ScriptType::P2TR_ScriptPath: return 3; // [signature, tapscript, control block]
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
 }
 
-// FIXME: Dedup with BuildSpendingTransaction in test/script_tests.cpp.
-static CMutableTransaction BuildSpendingTransaction(const CScript& scriptSig, const CMutableTransaction& txCredit)
+// Microbenchmark for verification of standard scripts.
+static void VerifyScriptBench(benchmark::Bench& bench, ScriptType script_type)
 {
-    CMutableTransaction txSpend;
-    txSpend.nVersion = 1;
-    txSpend.nLockTime = 0;
-    txSpend.vin.resize(1);
-    txSpend.vout.resize(1);
-    txSpend.vin[0].prevout.hash = txCredit.GetHash();
-    txSpend.vin[0].prevout.n = 0;
-    txSpend.vin[0].scriptSig = scriptSig;
-    txSpend.vin[0].nSequence = CTxIn::SEQUENCE_FINAL;
-    txSpend.vout[0].scriptPubKey = CScript();
-    txSpend.vout[0].nValue = txCredit.vout[0].nValue;
+    ECC_Context ecc_context{};
 
-    return txSpend;
-}
+    // Create deterministic key material needed for output script creation / signing
+    CKey privkey;
+    privkey.Set(uint256::ONE.begin(), uint256::ONE.end(), /*fCompressedIn=*/true);
+    CPubKey pubkey = privkey.GetPubKey();
+    XOnlyPubKey xonly_pubkey{pubkey};
+    CKeyID key_id = pubkey.GetID();
 
-// Microbenchmark for verification of a basic P2WPKH script. Can be easily
-// modified to measure performance of other types of scripts.
-static void VerifyScriptBench(benchmark::State& state)
-{
-    const int flags = SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_P2SH;
-    const int witnessversion = 0;
+    FlatSigningProvider keystore;
+    keystore.keys.emplace(key_id, privkey);
+    keystore.pubkeys.emplace(key_id, pubkey);
 
-    // Keypair.
-    CKey key;
-    static const std::array<unsigned char, 32> vchKey = {
-        {
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
-        }
-    };
-    key.Set(vchKey.begin(), vchKey.end(), false);
-    CPubKey pubkey = key.GetPubKey();
-    uint160 pubkeyHash;
-    CHash160().Write(pubkey.begin(), pubkey.size()).Finalize(pubkeyHash.begin());
+    // Create crediting and spending transactions with provided input type
+    const auto dest{[&]() -> CTxDestination {
+        switch (script_type) {
+        case ScriptType::P2WPKH: return WitnessV0KeyHash(pubkey);
+        case ScriptType::P2TR_KeyPath: return WitnessV1Taproot(xonly_pubkey);
+        case ScriptType::P2TR_ScriptPath:
+            TaprootBuilder builder;
+            builder.Add(0, CScript() << ToByteVector(xonly_pubkey) << OP_CHECKSIG, TAPROOT_LEAF_TAPSCRIPT);
+            builder.Finalize(XOnlyPubKey::NUMS_H); // effectively unspendable key-path
+            const auto output{builder.GetOutput()};
+            keystore.tr_trees.emplace(output, builder);
+            return output;
+        } // no default case, so the compiler can warn about missing cases
+        assert(false);
+    }()};
+    const CMutableTransaction& txCredit = BuildCreditingTransaction(GetScriptForDestination(dest), 1);
+    CMutableTransaction txSpend = BuildSpendingTransaction(/*scriptSig=*/{}, /*scriptWitness=*/{}, CTransaction(txCredit));
 
-    // Script.
-    CScript scriptPubKey = CScript() << witnessversion << ToByteVector(pubkeyHash);
-    CScript scriptSig;
-    CScript witScriptPubkey = CScript() << OP_DUP << OP_HASH160 << ToByteVector(pubkeyHash) << OP_EQUALVERIFY << OP_CHECKSIG;
-    CTransaction txCredit = BuildCreditingTransaction(scriptPubKey);
-    CMutableTransaction txSpend = BuildSpendingTransaction(scriptSig, txCredit);
-    CScriptWitness& witness = txSpend.vin[0].scriptWitness;
-    witness.stack.emplace_back();
-    key.Sign(SignatureHash(witScriptPubkey, txSpend, 0, SIGHASH_ALL, txCredit.vout[0].nValue, SIGVERSION_WITNESS_V0), witness.stack.back(), 0);
-    witness.stack.back().push_back(static_cast<unsigned char>(SIGHASH_ALL));
-    witness.stack.push_back(ToByteVector(pubkey));
+    // Sign spending transaction, precompute transaction data
+    PrecomputedTransactionData txdata;
+    {
+        const std::map<COutPoint, Coin> coins{
+            {txSpend.vin[0].prevout, Coin(txCredit.vout[0], /*nHeightIn=*/100, /*fCoinBaseIn=*/false)}
+        };
+        std::map<int, bilingual_str> input_errors;
+        bool complete = SignTransaction(txSpend, &keystore, coins, {.sighash_type = SIGHASH_ALL}, input_errors);
+        assert(complete);
+        // Weak sanity check on witness data to ensure we produced the intended spending type
+        assert(txSpend.vin[0].scriptWitness.stack.size() == ExpectedWitnessStackSize(script_type));
+        txdata.Init(txSpend, /*spent_outputs=*/{txCredit.vout[0]});
+    }
 
     // Benchmark.
-    while (state.KeepRunning()) {
+    bench.unit("script").run([&] {
         ScriptError err;
         bool success = VerifyScript(
             txSpend.vin[0].scriptSig,
             txCredit.vout[0].scriptPubKey,
             &txSpend.vin[0].scriptWitness,
-            flags,
-            MutableTransactionSignatureChecker(&txSpend, 0, txCredit.vout[0].nValue),
+            STANDARD_SCRIPT_VERIFY_FLAGS,
+            MutableTransactionSignatureChecker(&txSpend, 0, txCredit.vout[0].nValue, txdata, MissingDataBehavior::ASSERT_FAIL),
             &err);
         assert(err == SCRIPT_ERR_OK);
         assert(success);
-
-#if defined(HAVE_CONSENSUS_LIB)
-        CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
-        stream << txSpend;
-        int csuccess = bitcoinconsensus_verify_script_with_amount(
-            txCredit.vout[0].scriptPubKey.data(),
-            txCredit.vout[0].scriptPubKey.size(),
-            txCredit.vout[0].nValue,
-            (const unsigned char*)stream.data(), stream.size(), 0, flags, nullptr);
-        assert(csuccess == 1);
-#endif
-    }
+    });
 }
 
-BENCHMARK(VerifyScriptBench, 6300);
+static void VerifyScriptP2WPKH(benchmark::Bench& bench) { VerifyScriptBench(bench, ScriptType::P2WPKH); }
+static void VerifyScriptP2TR_KeyPath(benchmark::Bench& bench) { VerifyScriptBench(bench, ScriptType::P2TR_KeyPath); }
+static void VerifyScriptP2TR_ScriptPath(benchmark::Bench& bench) { VerifyScriptBench(bench, ScriptType::P2TR_ScriptPath); }
+
+static void VerifyNestedIfScript(benchmark::Bench& bench)
+{
+    std::vector<std::vector<unsigned char>> stack;
+    CScript script;
+    for (int i = 0; i < 100; ++i) {
+        script << OP_1 << OP_IF;
+    }
+    for (int i = 0; i < 1000; ++i) {
+        script << OP_1;
+    }
+    for (int i = 0; i < 100; ++i) {
+        script << OP_ENDIF;
+    }
+    bench.unit("script")
+        .setup([&] { stack.clear(); })
+        .run([&] {
+            ScriptError error;
+            const bool ret{EvalScript(stack, script, /*flags=*/0, BaseSignatureChecker(), SigVersion::BASE, &error)};
+            assert(ret && error == SCRIPT_ERR_OK);
+        });
+}
+
+BENCHMARK(VerifyScriptP2WPKH);
+BENCHMARK(VerifyScriptP2TR_KeyPath);
+BENCHMARK(VerifyScriptP2TR_ScriptPath);
+BENCHMARK(VerifyNestedIfScript);

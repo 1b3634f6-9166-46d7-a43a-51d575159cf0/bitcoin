@@ -1,41 +1,49 @@
-#!/usr/bin/env python
-# Copyright (c) 2015-2017 The Bitcoin Core developers
-# Distributed under the MIT software license, see the accompanying 
+#!/usr/bin/env python3
+# Copyright (c) 2015-present The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-import hashlib
-import sys
-import os
-from random import SystemRandom
-import base64
+from argparse import ArgumentParser
+from getpass import getpass
+from secrets import token_hex, token_urlsafe
 import hmac
+import json
 
-if len(sys.argv) < 2:
-    sys.stderr.write('Please include username as an argument.\n')
-    sys.exit(0)
+def generate_salt(size):
+    """Create size byte hex salt"""
+    return token_hex(size)
 
-username = sys.argv[1]
+def generate_password():
+    """Create 32 byte b64 password"""
+    return token_urlsafe(32)
 
-#This uses os.urandom() underneath
-cryptogen = SystemRandom()
+def password_to_hmac(salt, password):
+    m = hmac.new(salt.encode('utf-8'), password.encode('utf-8'), 'SHA256')
+    return m.hexdigest()
 
-#Create 16 byte hex salt
-salt_sequence = [cryptogen.randrange(256) for i in range(16)]
-hexseq = list(map(hex, salt_sequence))
-salt = "".join([x[2:] for x in hexseq])
+def main():
+    parser = ArgumentParser(description='Create login credentials for a JSON-RPC user')
+    parser.add_argument('username', help='the username for authentication')
+    parser.add_argument('password', help='leave empty to generate a random password or specify "-" to prompt for password', nargs='?')
+    parser.add_argument("-j", "--json", help="output to json instead of plain-text", action='store_true')
+    args = parser.parse_args()
 
-#Create 32 byte b64 password
-password = base64.urlsafe_b64encode(os.urandom(32))
+    if not args.password:
+        args.password = generate_password()
+    elif args.password == '-':
+        args.password = getpass()
 
-digestmod = hashlib.sha256
+    # Create 16 byte hex salt
+    salt = generate_salt(16)
+    password_hmac = password_to_hmac(salt, args.password)
 
-if sys.version_info.major >= 3:
-    password = password.decode('utf-8')
-    digestmod = 'SHA256'
- 
-m = hmac.new(bytearray(salt, 'utf-8'), bytearray(password, 'utf-8'), digestmod)
-result = m.hexdigest()
+    if args.json:
+        odict={'username':args.username, 'password':args.password, 'rpcauth':f'{args.username}:{salt}${password_hmac}'}
+        print(json.dumps(odict))
+    else:
+        print('String to be appended to bitcoin.conf:')
+        print(f'rpcauth={args.username}:{salt}${password_hmac}')
+        print(f'Your password:\n{args.password}')
 
-print("String to be appended to bitcoin.conf:")
-print("rpcauth="+username+":"+salt+"$"+result)
-print("Your password:\n"+password)
+if __name__ == '__main__':
+    main()

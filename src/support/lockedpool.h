@@ -1,15 +1,16 @@
-// Copyright (c) 2016-2017 The Bitcoin Core developers
+// Copyright (c) 2016-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_SUPPORT_LOCKEDPOOL_H
 #define BITCOIN_SUPPORT_LOCKEDPOOL_H
 
-#include <stdint.h>
+#include <cstddef>
 #include <list>
 #include <map>
-#include <mutex>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 /**
  * OS-dependent allocation and deallocation of locked/pinned memory pages.
@@ -18,10 +19,10 @@
 class LockedPageAllocator
 {
 public:
-    virtual ~LockedPageAllocator() {}
+    virtual ~LockedPageAllocator() = default;
     /** Allocate and lock memory pages.
      * If len is not a multiple of the system page size, it is rounded up.
-     * Returns 0 in case of allocation failure.
+     * Returns nullptr in case of allocation failure.
      *
      * If locking the memory pages could not be accomplished it will still
      * return the memory, however the lockingSuccess flag will be false.
@@ -88,15 +89,23 @@ public:
      */
     bool addressInArena(void *ptr) const { return ptr >= base && ptr < end; }
 private:
-    /** Map of chunk address to chunk information. This class makes use of the
-     * sorted order to merge previous and next chunks during deallocation.
-     */
-    std::map<char*, size_t> chunks_free;
-    std::map<char*, size_t> chunks_used;
+    typedef std::multimap<size_t, void*> SizeToChunkSortedMap;
+    /** Map to enable O(log(n)) best-fit allocation, as it's sorted by size */
+    SizeToChunkSortedMap size_to_free_chunk;
+
+    typedef std::unordered_map<void*, SizeToChunkSortedMap::const_iterator> ChunkToSizeMap;
+    /** Map from begin of free chunk to its node in size_to_free_chunk */
+    ChunkToSizeMap chunks_free;
+    /** Map from end of free chunk to its node in size_to_free_chunk */
+    ChunkToSizeMap chunks_free_end;
+
+    /** Map from begin of used chunk to its size */
+    std::unordered_map<void*, size_t> chunks_used;
+
     /** Base address of arena */
-    char* base;
+    void* base;
     /** End address of arena */
-    char* end;
+    void* end;
     /** Minimum chunk alignment */
     size_t alignment;
 };
@@ -122,11 +131,11 @@ public:
      * allocation and deallocation overhead. Setting it too high allocates
      * more locked memory from the OS than strictly necessary.
      */
-    static const size_t ARENA_SIZE = 256*1024;
+    static constexpr size_t ARENA_SIZE{256*1024};
     /** Chunk alignment. Another compromise. Setting this too high will waste
      * memory, setting it too low will facilitate fragmentation.
      */
-    static const size_t ARENA_ALIGN = 16;
+    static constexpr size_t ARENA_ALIGN{16};
 
     /** Callback when allocation succeeds but locking fails.
      */
@@ -189,7 +198,7 @@ private:
 
     std::list<LockedPageArena> arenas;
     LockingFailed_Callback lf_cb;
-    size_t cumulative_bytes_locked;
+    size_t cumulative_bytes_locked{0};
     /** Mutex protects access to this pool's data structures, including arenas.
      */
     mutable std::mutex mutex;
@@ -210,11 +219,7 @@ class LockedPoolManager : public LockedPool
 {
 public:
     /** Return the current instance, or create it once */
-    static LockedPoolManager& Instance()
-    {
-        std::call_once(LockedPoolManager::init_flag, LockedPoolManager::CreateInstance);
-        return *LockedPoolManager::_instance;
-    }
+    static LockedPoolManager& Instance();
 
 private:
     explicit LockedPoolManager(std::unique_ptr<LockedPageAllocator> allocator);
@@ -225,7 +230,6 @@ private:
     static bool LockingFailed();
 
     static LockedPoolManager* _instance;
-    static std::once_flag init_flag;
 };
 
 #endif // BITCOIN_SUPPORT_LOCKEDPOOL_H
